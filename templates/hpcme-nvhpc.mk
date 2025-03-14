@@ -44,7 +44,7 @@ NETCDF =             # If value is '3' and CPPDEFS contains
 
                      # A list of -I Include directories to be added to the
                      # the compile command.
-INCLUDES := $(shell pkg-config --cflags yaml-0.1)
+INCLUDES := -I/opt/views/view/include
 
 COVERAGE =           # Add the code coverage compile options.
 
@@ -140,7 +140,7 @@ LDFLAGS_VERBOSE := -v
 LDFLAGS_COVERAGE :=
 
 # List of -L library directories to be added to the compile and linking commands
-LIBS := $(shell pkg-config --libs yaml-0.1)
+LIBS := -L/opt/views/view/lib -lyaml
 
 # Get compile flags based on target macros.
 ifdef REPRO
