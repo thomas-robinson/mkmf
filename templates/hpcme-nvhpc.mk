@@ -95,7 +95,7 @@ CPPDEFS += -DHAVE_SCHED_GETAFFINITY -DHAVE_GETTID
 # Macro for Fortran preprocessor
 FPPFLAGS := $(INCLUDES)
 # Fortran Compiler flags for the NetCDF library
-FPPFLAGS += $(shell nf-config --fflags)
+FPPFLAGS += $(shell nf-config --fflags) -I/opt/views/view/include
 
 # Base set of Fortran compiler flags
 FFLAGS = -i4 $(REAL_PRECISION) -byteswapio -Mcray=pointer -Mcray=pointer -Mflushz -Mdaz -D_F2000
@@ -113,7 +113,7 @@ FFLAGS_COVERAGE =
 # Macro for C preprocessor
 CPPFLAGS := $(INCLUDES)
 # C Compiler flags for the NetCDF library
-CPPFLAGS += $(shell nc-config --cflags)
+CPPFLAGS += $(shell nc-config --cflags) -I/opt/views/view/include
 
 # Base set of C compiler flags
 CFLAGS =
