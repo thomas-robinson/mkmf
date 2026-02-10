@@ -485,6 +485,16 @@ def collect_sources(targets, abs_path=None, include_dirs=None):
     scanned_objects = set()  # type: Set[str]
     found_include_dirs = []  # type: List[Path]
 
+    def add_include_dir(dir_path):
+        # type: (Path) -> None
+        """Add a directory and its include/ subdirectory to found_include_dirs."""
+        if dir_path not in found_include_dirs:
+            found_include_dirs.append(dir_path)
+        # Also check for include/ subdirectory (common pattern in FMS and similar projects)
+        include_subdir = dir_path / "include"
+        if include_subdir.is_dir() and include_subdir not in found_include_dirs:
+            found_include_dirs.append(include_subdir)
+
     for target in targets:
         target_path = Path(target)
 
@@ -499,7 +509,7 @@ def collect_sources(targets, abs_path=None, include_dirs=None):
                 if source.object_name not in scanned_objects:
                     sources.append(source)
                     scanned_objects.add(source.object_name)
-                    found_include_dirs.append(target_path)
+                    add_include_dir(target_path)
         elif target_path.is_file():
             if is_source_file(target_path):
                 # Individual source file
@@ -507,12 +517,10 @@ def collect_sources(targets, abs_path=None, include_dirs=None):
                     source = scan_file_for_dependencies(target_path)
                     sources.append(source)
                     scanned_objects.add(source.object_name)
-                    if target_path.parent not in found_include_dirs:
-                        found_include_dirs.append(target_path.parent)
+                    add_include_dir(target_path.parent)
             elif is_include_file(target_path):
                 # Include file - add directory to include paths
-                if target_path.parent not in found_include_dirs:
-                    found_include_dirs.append(target_path.parent)
+                add_include_dir(target_path.parent)
             else:
                 # Assume it's a pathnames file
                 path_sources = collect_sources_from_pathnames_file(target_path, abs_path)
@@ -520,8 +528,7 @@ def collect_sources(targets, abs_path=None, include_dirs=None):
                     if source.object_name not in scanned_objects:
                         sources.append(source)
                         scanned_objects.add(source.object_name)
-                        if source.path.parent not in found_include_dirs:
-                            found_include_dirs.append(source.path.parent)
+                        add_include_dir(source.path.parent)
 
     # Add explicit include directories
     if include_dirs:
