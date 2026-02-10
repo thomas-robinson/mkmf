@@ -967,10 +967,12 @@ def generate_cmakelists(
         lines.append("")
 
     # Fortran module output directory
+    # Put modules in the top-level build directory (same as mkmf behavior)
+    # This allows -I$bld_dir/FMS to find both the library and module files
     lines.extend([
         "# Fortran module output directory",
-        'set(CMAKE_Fortran_MODULE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/modules")',
-        'include_directories("${CMAKE_Fortran_MODULE_DIRECTORY}")',
+        "# Modules are placed in the top-level build directory for mkmf compatibility",
+        'set(CMAKE_Fortran_MODULE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")',
         "",
     ])
 
@@ -1157,7 +1159,7 @@ def generate_cmakelists(
         ")",
         "",
         "# Install Fortran modules",
-        'install(DIRECTORY "${CMAKE_Fortran_MODULE_DIRECTORY}/"',
+        'install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/"',
         "    DESTINATION include",
         '    FILES_MATCHING PATTERN "*.mod"',
         ")",
