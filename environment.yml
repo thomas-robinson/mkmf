@@ -1,0 +1,54 @@
+# Conda environment for mkcf - CMakeLists.txt generator
+#
+# This environment provides all dependencies needed to run mkcf.
+#
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate mkcf
+#
+# Or with mamba (faster):
+#   mamba env create -f environment.yml
+#   mamba activate mkcf
+
+name: mkcf
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python version
+  - python>=3.9
+
+  # Required packages
+  - click>=8.0            # Command-line interface framework
+
+  # Optional but recommended for development
+  - pip>=21.0
+
+  # Testing dependencies
+  - pytest>=7.0           # Testing framework
+  - pytest-cov>=4.0       # Coverage reporting
+  - pytest-mock>=3.0      # Mocking support
+
+  # Build tools (for testing the generated CMakeLists.txt)
+  - cmake>=3.18
+  - make
+  - gfortran              # GNU Fortran compiler for testing
+  - gcc                   # GNU C compiler for testing
+
+  # Documentation (optional)
+  - sphinx>=5.0           # Documentation generator
+  - sphinx-rtd-theme      # ReadTheDocs theme
+  - sphinx-click          # Click documentation extension
+
+  # Code quality (optional)
+  - black                 # Code formatter
+  - flake8                # Linter
+  - mypy                  # Type checker
+  - isort                 # Import sorter
+
+  # pip packages (if any are not available via conda)
+  - pip:
+    # Add any pip-only packages here if needed
+    []

@@ -1,0 +1,1365 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mkcf: CMakeLists.txt generator for Fortran/C scientific code.
+
+This tool is a drop-in replacement for mkmf that generates CMakeLists.txt files
+instead of Makefiles. It parses Fortran and C source files to resolve module
+dependencies and generates a proper CMake configuration.
+
+        Based on mkmf by V. Balaji (@balaji-gfdl) and Seth Underwood (@underwoo)
+        Princeton University/GFDL
+
+AUTHOR: Tom Robinson 
+        NOAA/GFDL
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+Usage:
+    mkcf [OPTIONS] [TARGETS]...
+
+Example:
+    mkcf -t template.mk -p libFMS.a -c "-DUSE_NETCDF" path_names
+    cmake -DCMAKE_BUILD_TYPE=Release .
+    make
+"""
+
+import os
+import re
+import sys
+from pathlib import Path
+
+# Handle typing imports for Python 3.6+ compatibility
+try:
+    from typing import Dict, List, Optional, Set, Tuple
+except ImportError:
+    pass
+
+import click
+
+# Version of mkcf
+__version__ = "2024.01.00"
+
+
+# =============================================================================
+# Data Classes (using simple classes for Python 3.6 compatibility)
+# =============================================================================
+
+
+class SourceFile:
+    """Represents a source file with its metadata and dependencies.
+
+    Attributes:
+        path: Absolute path to the source file.
+        name: Base name of the file without extension.
+        suffix: File extension (e.g., '.F90', '.c').
+        object_name: Name of the object file that will be generated.
+        modules_defined: List of Fortran modules defined in this file.
+        modules_used: List of Fortran modules used by this file.
+        includes: List of include files referenced by this file.
+        requires_cpp: Whether the file requires C preprocessing.
+    """
+
+    def __init__(
+        self,
+        path,  # type: Path
+        name,  # type: str
+        suffix,  # type: str
+        object_name,  # type: str
+        modules_defined=None,  # type: Optional[List[str]]
+        modules_used=None,  # type: Optional[List[str]]
+        includes=None,  # type: Optional[List[str]]
+        requires_cpp=False,  # type: bool
+    ):
+        # type: (...) -> None
+        self.path = path
+        self.name = name
+        self.suffix = suffix
+        self.object_name = object_name
+        self.modules_defined = modules_defined if modules_defined is not None else []
+        self.modules_used = modules_used if modules_used is not None else []
+        self.includes = includes if includes is not None else []
+        self.requires_cpp = requires_cpp
+
+
+class TemplateConfig:
+    """Configuration extracted from a mkmf template file.
+
+    Attributes:
+        fc: Fortran compiler command.
+        cc: C compiler command.
+        cxx: C++ compiler command.
+        ld: Linker command.
+        fflags_base: Base Fortran compiler flags.
+        fflags_opt: Optimization Fortran flags.
+        fflags_repro: Reproducibility Fortran flags.
+        fflags_debug: Debug Fortran flags.
+        fflags_openmp: OpenMP Fortran flags.
+        cflags_base: Base C compiler flags.
+        cflags_opt: Optimization C flags.
+        cflags_repro: Reproducibility C flags.
+        cflags_debug: Debug C flags.
+        cflags_openmp: OpenMP C flags.
+        cppflags: C preprocessor flags.
+        fppflags: Fortran preprocessor flags.
+        ldflags: Linker flags.
+        ldflags_openmp: OpenMP linker flags.
+        libs: Libraries to link.
+        cppdefs: CPP definitions from template.
+        includes: Include directories from template.
+        real_precision_r4: Real precision flag for R4.
+        real_precision_r8: Real precision flag for R8.
+    """
+
+    def __init__(self):
+        # type: () -> None
+        self.fc = "gfortran"  # type: str
+        self.cc = "gcc"  # type: str
+        self.cxx = "g++"  # type: str
+        self.ld = "gfortran"  # type: str
+        self.fflags_base = ""  # type: str
+        self.fflags_opt = "-O3"  # type: str
+        self.fflags_repro = "-O2"  # type: str
+        self.fflags_debug = "-O0 -g"  # type: str
+        self.fflags_test = ""  # type: str
+        self.fflags_openmp = "-fopenmp"  # type: str
+        self.fflags_coverage = ""  # type: str
+        self.cflags_base = ""  # type: str
+        self.cflags_opt = "-O2"  # type: str
+        self.cflags_repro = "-O2"  # type: str
+        self.cflags_debug = "-O0 -g"  # type: str
+        self.cflags_test = ""  # type: str
+        self.cflags_openmp = "-fopenmp"  # type: str
+        self.cflags_coverage = ""  # type: str
+        self.cppflags = ""  # type: str
+        self.fppflags = ""  # type: str
+        self.ldflags = ""  # type: str
+        self.ldflags_openmp = "-fopenmp"  # type: str
+        self.ldflags_coverage = ""  # type: str
+        self.libs = ""  # type: str
+        self.cppdefs = ""  # type: str
+        self.includes = ""  # type: str
+        self.real_precision_r4 = ""  # type: str
+        self.real_precision_r8 = ""  # type: str
+
+
+# =============================================================================
+# Template Parser
+# =============================================================================
+
+
+def parse_template(template_path):
+    # type: (Path) -> TemplateConfig
+    """Parse a mkmf template file and extract configuration.
+
+    This function reads a makefile-style template and extracts compiler
+    settings, flags, and other build configuration that will be translated
+    into CMake variables.
+
+    Args:
+        template_path: Path to the mkmf template file.
+
+    Returns:
+        TemplateConfig object containing the parsed configuration.
+
+    Raises:
+        FileNotFoundError: If the template file does not exist.
+    """
+    config = TemplateConfig()
+
+    if not template_path.exists():
+        raise FileNotFoundError("Template file not found: {}".format(template_path))
+
+    content = template_path.read_text()
+
+    # Pattern to match variable assignments (handles := and =)
+    # This captures the variable name and its value, handling line continuations
+    var_pattern = re.compile(
+        r"^\s*([A-Z_][A-Z0-9_]*)\s*[:?]?=\s*(.*)$", re.MULTILINE
+    )
+
+    # Collect all variable definitions
+    variables = {}  # type: Dict[str, str]
+    lines = content.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        # Skip comments and empty lines
+        if line.strip().startswith("#") or not line.strip():
+            i += 1
+            continue
+
+        match = var_pattern.match(line)
+        if match:
+            var_name = match.group(1)
+            var_value = match.group(2).strip()
+
+            # Handle line continuations
+            while var_value.endswith("\\") and i + 1 < len(lines):
+                i += 1
+                var_value = var_value[:-1] + " " + lines[i].strip()
+
+            # Remove trailing backslash if any
+            var_value = var_value.rstrip("\\").strip()
+
+            # Store the variable
+            variables[var_name] = var_value
+        i += 1
+
+    # Map variables to config
+    config.fc = variables.get("FC", config.fc)
+    config.cc = variables.get("CC", config.cc)
+    config.cxx = variables.get("CXX", config.cxx)
+    config.ld = variables.get("LD", config.ld)
+
+    config.fflags_base = variables.get("FFLAGS", config.fflags_base)
+    config.fflags_opt = variables.get("FFLAGS_OPT", config.fflags_opt)
+    config.fflags_repro = variables.get("FFLAGS_REPRO", config.fflags_repro)
+    config.fflags_debug = variables.get("FFLAGS_DEBUG", config.fflags_debug)
+    config.fflags_test = variables.get("FFLAGS_TEST", config.fflags_test)
+    config.fflags_openmp = variables.get("FFLAGS_OPENMP", config.fflags_openmp)
+    config.fflags_coverage = variables.get("FFLAGS_COVERAGE", config.fflags_coverage)
+
+    config.cflags_base = variables.get("CFLAGS", config.cflags_base)
+    config.cflags_opt = variables.get("CFLAGS_OPT", config.cflags_opt)
+    config.cflags_repro = variables.get("CFLAGS_REPRO", config.cflags_repro)
+    config.cflags_debug = variables.get("CFLAGS_DEBUG", config.cflags_debug)
+    config.cflags_test = variables.get("CFLAGS_TEST", config.cflags_test)
+    config.cflags_openmp = variables.get("CFLAGS_OPENMP", config.cflags_openmp)
+    config.cflags_coverage = variables.get("CFLAGS_COVERAGE", config.cflags_coverage)
+
+    config.cppflags = variables.get("CPPFLAGS", config.cppflags)
+    config.fppflags = variables.get("FPPFLAGS", config.fppflags)
+
+    config.ldflags = variables.get("LDFLAGS", config.ldflags)
+    config.ldflags_openmp = variables.get("LDFLAGS_OPENMP", config.ldflags_openmp)
+    config.ldflags_coverage = variables.get("LDFLAGS_COVERAGE", config.ldflags_coverage)
+
+    config.libs = variables.get("LIBS", config.libs)
+    config.cppdefs = variables.get("CPPDEFS", config.cppdefs)
+    config.includes = variables.get("INCLUDES", config.includes)
+
+    # Handle real precision
+    if "REAL_PRECISION" in variables:
+        # Check if template has conditional R4/R8 handling
+        config.real_precision_r8 = variables.get("REAL_PRECISION", "")
+
+    return config
+
+
+# =============================================================================
+# Source File Scanner
+# =============================================================================
+
+
+# Suffixes for source files
+SRC_SUFFIXES = {".F", ".F90", ".c", ".C", ".cc", ".cpp", ".cxx", ".c++", ".f", ".f90"}
+INC_SUFFIXES = {".H", ".fh", ".h", ".inc", ".h90"}
+FORTRAN_SUFFIXES = {".F", ".F90", ".f", ".f90"}
+PREPROCESSED_FORTRAN_SUFFIXES = {".F", ".F90"}
+C_SUFFIXES = {".c", ".C", ".cc", ".cpp", ".cxx", ".c++"}
+
+
+def get_suffix(path):
+    # type: (Path) -> str
+    """Get the file suffix, preserving case for Fortran files.
+
+    Args:
+        path: Path to the file.
+
+    Returns:
+        The file suffix with proper case handling.
+    """
+    suffix = path.suffix
+    # Check if the original suffix matches any known suffix case-sensitively
+    for known_suffix in SRC_SUFFIXES | INC_SUFFIXES:
+        if path.name.endswith(known_suffix):
+            return known_suffix
+    return suffix
+
+
+def is_source_file(path):
+    # type: (Path) -> bool
+    """Check if a path is a recognized source file.
+
+    Args:
+        path: Path to check.
+
+    Returns:
+        True if the path is a source file, False otherwise.
+    """
+    suffix = get_suffix(path)
+    return suffix in SRC_SUFFIXES
+
+
+def is_include_file(path):
+    # type: (Path) -> bool
+    """Check if a path is a recognized include file.
+
+    Args:
+        path: Path to check.
+
+    Returns:
+        True if the path is an include file, False otherwise.
+    """
+    suffix = get_suffix(path)
+    return suffix in INC_SUFFIXES
+
+
+def scan_file_for_dependencies(file_path):
+    # type: (Path) -> SourceFile
+    """Scan a source file for module definitions, uses, and includes.
+
+    This function parses Fortran and C source files to find:
+    - Fortran module definitions (module <name>)
+    - Fortran module uses (use <name>)
+    - Fortran submodule definitions and parent dependencies
+    - Include statements (#include or include)
+
+    Args:
+        file_path: Path to the source file to scan.
+
+    Returns:
+        SourceFile object containing the parsed dependency information.
+    """
+    suffix = get_suffix(file_path)
+    name = file_path.stem
+
+    source = SourceFile(
+        path=file_path.resolve(),
+        name=name,
+        suffix=suffix,
+        object_name="{}.o".format(name),
+        requires_cpp=suffix in PREPROCESSED_FORTRAN_SUFFIXES,
+    )
+
+    try:
+        content = file_path.read_text(errors="replace")
+    except Exception:
+        return source
+
+    # Patterns for Fortran
+    # Module definition: module <name> (but not "module subroutine", "module function", "module procedure")
+    module_def_pattern = re.compile(
+        r"^\s*module\s+(?!subroutine|function|procedure)(\w+)", re.IGNORECASE | re.MULTILINE
+    )
+    # Submodule definition: submodule (<parent>) <name>
+    submodule_pattern = re.compile(
+        r"^\s*submodule\s*\(\s*(\w+)\s*\)\s*(\w+)", re.IGNORECASE | re.MULTILINE
+    )
+    # Use statement: use <name>
+    use_pattern = re.compile(r"^\s*use\s+(\w+)", re.IGNORECASE | re.MULTILINE)
+    # Include statements (both preprocessor and Fortran style)
+    include_pattern = re.compile(
+        r'^[\s#]*include\s*[<"\']([^>"\']+)[>"\']', re.IGNORECASE | re.MULTILINE
+    )
+
+    # Find module definitions
+    for match in module_def_pattern.finditer(content):
+        module_name = match.group(1).lower()
+        if module_name not in source.modules_defined:
+            source.modules_defined.append(module_name)
+
+    # Find submodule definitions (these create dependencies on parent modules)
+    for match in submodule_pattern.finditer(content):
+        parent_module = match.group(1).lower()
+        if parent_module not in source.modules_used:
+            source.modules_used.append(parent_module)
+
+    # Find use statements
+    for match in use_pattern.finditer(content):
+        module_name = match.group(1).lower()
+        if module_name not in source.modules_used:
+            source.modules_used.append(module_name)
+
+    # Find include statements
+    for match in include_pattern.finditer(content):
+        include_name = match.group(1)
+        if include_name not in source.includes:
+            source.includes.append(include_name)
+
+    return source
+
+
+def collect_sources_from_directory(directory, scanned):
+    # type: (Path, Set[Path]) -> List[SourceFile]
+    """Collect all source files from a directory.
+
+    Args:
+        directory: Path to the directory to scan.
+        scanned: Set of already scanned paths to avoid duplicates.
+
+    Returns:
+        List of SourceFile objects found in the directory.
+    """
+    sources = []  # type: List[SourceFile]
+
+    if not directory.is_dir():
+        return sources
+
+    if directory in scanned:
+        return sources
+
+    scanned.add(directory)
+
+    for item in directory.iterdir():
+        if item.is_file() and is_source_file(item):
+            source = scan_file_for_dependencies(item)
+            sources.append(source)
+
+    return sources
+
+
+def collect_sources_from_pathnames_file(pathnames_file, abs_path=None):
+    # type: (Path, Optional[Path]) -> List[SourceFile]
+    """Collect source files listed in a pathnames file.
+
+    The pathnames file is typically generated by list_paths and contains
+    one source file path per line.
+
+    Args:
+        pathnames_file: Path to the pathnames file.
+        abs_path: Optional absolute path prefix to prepend to relative paths.
+
+    Returns:
+        List of SourceFile objects.
+    """
+    sources = []  # type: List[SourceFile]
+    scanned_objects = set()  # type: Set[str]
+
+    if not pathnames_file.exists():
+        return sources
+
+    for line in pathnames_file.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # Handle potential command prefix (for special compile commands)
+        words = line.split()
+        file_path_str = words[-1]  # Last word is the file path
+
+        file_path = Path(file_path_str)
+
+        # Apply absolute path prefix if needed
+        if abs_path and not file_path.is_absolute():
+            file_path = abs_path / file_path
+
+        if not file_path.exists():
+            continue
+
+        if not is_source_file(file_path):
+            continue
+
+        # Avoid duplicate objects
+        obj_name = "{}.o".format(file_path.stem)
+        if obj_name in scanned_objects:
+            continue
+        scanned_objects.add(obj_name)
+
+        source = scan_file_for_dependencies(file_path)
+        sources.append(source)
+
+    return sources
+
+
+def collect_sources(targets, abs_path=None, include_dirs=None):
+    # type: (List[str], Optional[Path], Optional[List[str]]) -> Tuple[List[SourceFile], List[Path]]
+    """Collect all source files from targets.
+
+    Targets can be directories, individual files, or pathnames files.
+
+    Args:
+        targets: List of target paths (directories, files, or pathnames files).
+        abs_path: Optional absolute path prefix for relative paths.
+        include_dirs: Additional include directories to scan.
+
+    Returns:
+        Tuple of (list of SourceFile objects, list of include directories).
+    """
+    sources = []  # type: List[SourceFile]
+    scanned = set()  # type: Set[Path]
+    scanned_objects = set()  # type: Set[str]
+    found_include_dirs = []  # type: List[Path]
+
+    for target in targets:
+        target_path = Path(target)
+
+        # Apply absolute path prefix
+        if abs_path and not target_path.is_absolute():
+            target_path = abs_path / target_path
+
+        if target_path.is_dir():
+            # Scan directory for source files
+            dir_sources = collect_sources_from_directory(target_path, scanned)
+            for source in dir_sources:
+                if source.object_name not in scanned_objects:
+                    sources.append(source)
+                    scanned_objects.add(source.object_name)
+                    found_include_dirs.append(target_path)
+        elif target_path.is_file():
+            if is_source_file(target_path):
+                # Individual source file
+                if target_path.stem + ".o" not in scanned_objects:
+                    source = scan_file_for_dependencies(target_path)
+                    sources.append(source)
+                    scanned_objects.add(source.object_name)
+                    if target_path.parent not in found_include_dirs:
+                        found_include_dirs.append(target_path.parent)
+            elif is_include_file(target_path):
+                # Include file - add directory to include paths
+                if target_path.parent not in found_include_dirs:
+                    found_include_dirs.append(target_path.parent)
+            else:
+                # Assume it's a pathnames file
+                path_sources = collect_sources_from_pathnames_file(target_path, abs_path)
+                for source in path_sources:
+                    if source.object_name not in scanned_objects:
+                        sources.append(source)
+                        scanned_objects.add(source.object_name)
+                        if source.path.parent not in found_include_dirs:
+                            found_include_dirs.append(source.path.parent)
+
+    # Add explicit include directories
+    if include_dirs:
+        for inc_dir in include_dirs:
+            inc_path = Path(inc_dir)
+            if abs_path and not inc_path.is_absolute():
+                inc_path = abs_path / inc_path
+            if inc_path.is_dir() and inc_path not in found_include_dirs:
+                found_include_dirs.append(inc_path)
+
+    return sources, found_include_dirs
+
+
+# =============================================================================
+# CMakeLists.txt Generator
+# =============================================================================
+
+
+def clean_flags(flags):
+    # type: (str) -> str
+    """Clean up compiler flags string.
+
+    Removes make variable references like $(VARIABLE) and cleans whitespace.
+
+    Args:
+        flags: Raw flags string from template.
+
+    Returns:
+        Cleaned flags string suitable for CMake.
+    """
+    # Remove make variable references like $(VARIABLE)
+    cleaned = re.sub(r"\$\([^)]+\)", "", flags)
+    # Clean up whitespace
+    cleaned = " ".join(cleaned.split())
+    return cleaned
+
+
+def generate_cmakelists(
+    sources,  # type: List[SourceFile]
+    include_dirs,  # type: List[Path]
+    program_name,  # type: str
+    cppdefs,  # type: str
+    other_flags,  # type: str
+    link_flags,  # type: str
+    template_config,  # type: Optional[TemplateConfig]
+    src_root,  # type: Optional[Path]
+    build_root,  # type: Optional[Path]
+    use_cpp,  # type: bool
+    verbose,  # type: bool
+):
+    # type: (...) -> str
+    """Generate CMakeLists.txt content.
+
+    This function generates a complete CMakeLists.txt file that:
+    - Configures Fortran and C compilers
+    - Supports build types (PROD, REPRO, DEBUG, TEST)
+    - Handles OpenMP, COVERAGE, and NETCDF options
+    - Manages Fortran module dependencies
+    - Supports C preprocessing of Fortran files (--use-cpp)
+
+    Args:
+        sources: List of source files to include in the build.
+        include_dirs: List of include directories.
+        program_name: Name of the target (library or executable).
+        cppdefs: C preprocessor definitions.
+        other_flags: Additional compiler flags.
+        link_flags: Additional linker flags.
+        template_config: Configuration from mkmf template file.
+        src_root: Source root directory.
+        build_root: Build root directory.
+        use_cpp: Whether to use C preprocessor on Fortran files.
+        verbose: Enable verbose output.
+
+    Returns:
+        String containing the complete CMakeLists.txt content.
+    """
+    lines = []  # type: List[str]
+
+    # CMake header
+    lines.extend([
+        "# CMakeLists.txt generated by mkcf",
+        "# This file was automatically generated. Manual edits may be overwritten.",
+        "",
+        "cmake_minimum_required(VERSION 3.18)",
+        "",
+    ])
+
+    # Determine if building library or executable
+    is_library = program_name.endswith(".a")
+    if is_library and program_name.startswith("lib"):
+        target_name = program_name[3:-2]
+    else:
+        target_name = program_name.replace(".a", "")
+
+    # Project declaration
+    lines.extend([
+        "project({} LANGUAGES Fortran C)".format(target_name),
+        "",
+    ])
+
+    # Include CMake modules
+    lines.extend([
+        "# Include CMake modules",
+        "include(CheckLanguage)",
+        "",
+    ])
+
+    # Check for C++ if needed
+    cxx_sources = [s for s in sources if s.suffix in {".C", ".cc", ".cpp", ".cxx", ".c++"}]
+    if cxx_sources:
+        lines.extend([
+            "# Check for C++ support",
+            "check_language(CXX)",
+            "if(CMAKE_CXX_COMPILER)",
+            "    enable_language(CXX)",
+            "endif()",
+            "",
+        ])
+
+    # Build type options
+    lines.extend([
+        "# =============================================================================",
+        "# Build Options",
+        "# =============================================================================",
+        "",
+        "# Build type options (mutually exclusive)",
+        "# Use: cmake -DPROD=ON or cmake -DREPRO=ON or cmake -DDEBUG_BUILD=ON",
+        'option(PROD "Build with production/optimization flags" OFF)',
+        'option(REPRO "Build with reproducibility flags" OFF)',
+        'option(DEBUG_BUILD "Build with debug flags" OFF)',
+        'option(TEST_BUILD "Build with test flags" OFF)',
+        "",
+        "# Additional build options",
+        'option(OPENMP "Enable OpenMP support" OFF)',
+        'option(COVERAGE "Enable code coverage" OFF)',
+        'option(VERBOSE "Enable verbose output" OFF)',
+        'option(USE_R4 "Use single precision (R4) for reals" OFF)',
+        'set(NETCDF "" CACHE STRING "NetCDF version (3 or empty)")',
+        "",
+    ])
+
+    # Use-cpp option
+    if use_cpp:
+        lines.extend([
+            "# C Preprocessor for Fortran files",
+            'option(USE_CPP "Use C preprocessor for .F90 files" ON)',
+            "",
+        ])
+
+    # Validate mutually exclusive options
+    lines.extend([
+        "# Validate mutually exclusive build type options",
+        "set(_build_type_count 0)",
+        "if(PROD)",
+        '    math(EXPR _build_type_count "${_build_type_count} + 1")',
+        "endif()",
+        "if(REPRO)",
+        '    math(EXPR _build_type_count "${_build_type_count} + 1")',
+        "endif()",
+        "if(DEBUG_BUILD)",
+        '    math(EXPR _build_type_count "${_build_type_count} + 1")',
+        "endif()",
+        "if(TEST_BUILD)",
+        '    math(EXPR _build_type_count "${_build_type_count} + 1")',
+        "endif()",
+        "",
+        "if(_build_type_count GREATER 1)",
+        '    message(FATAL_ERROR "PROD, REPRO, DEBUG_BUILD, and TEST_BUILD are mutually exclusive")',
+        "endif()",
+        "",
+        "# Default to PROD if no build type specified",
+        "if(_build_type_count EQUAL 0)",
+        "    set(PROD ON)",
+        "endif()",
+        "",
+    ])
+
+    # Source and build roots
+    if src_root:
+        lines.extend([
+            'set(SRCROOT "{}")'.format(src_root),
+            "",
+        ])
+    if build_root:
+        lines.extend([
+            'set(BUILDROOT "{}")'.format(build_root),
+            "",
+        ])
+
+    # Configure compilers from template or use defaults
+    if template_config:
+        # Compiler configuration from template
+        fc = template_config.fc
+        cc = template_config.cc
+
+        lines.extend([
+            "# =============================================================================",
+            "# Compiler Configuration (from template)",
+            "# =============================================================================",
+            "",
+            "# Template compilers: FC={}, CC={}".format(fc, cc),
+            "# These can be overridden by environment variables or CMake cache",
+            "",
+        ])
+
+        # Base flags
+        fflags_base = clean_flags(template_config.fflags_base)
+        cflags_base = clean_flags(template_config.cflags_base)
+        fflags_opt = clean_flags(template_config.fflags_opt)
+        fflags_repro = clean_flags(template_config.fflags_repro)
+        fflags_debug = clean_flags(template_config.fflags_debug)
+        fflags_test = clean_flags(template_config.fflags_test) or fflags_opt
+        cflags_opt = clean_flags(template_config.cflags_opt)
+        cflags_repro = clean_flags(template_config.cflags_repro)
+        cflags_debug = clean_flags(template_config.cflags_debug)
+        cflags_test = clean_flags(template_config.cflags_test) or cflags_opt
+        fflags_openmp = clean_flags(template_config.fflags_openmp)
+        cflags_openmp = clean_flags(template_config.cflags_openmp)
+        ldflags_openmp = clean_flags(template_config.ldflags_openmp)
+        fflags_coverage = clean_flags(template_config.fflags_coverage)
+        cflags_coverage = clean_flags(template_config.cflags_coverage)
+
+        lines.extend([
+            "# Base compiler flags",
+            'set(FFLAGS_BASE "{}")'.format(fflags_base),
+            'set(CFLAGS_BASE "{}")'.format(cflags_base),
+            "",
+            "# Optimization flags (PROD)",
+            'set(FFLAGS_OPT "{}")'.format(fflags_opt),
+            'set(CFLAGS_OPT "{}")'.format(cflags_opt),
+            "",
+            "# Reproducibility flags (REPRO)",
+            'set(FFLAGS_REPRO "{}")'.format(fflags_repro),
+            'set(CFLAGS_REPRO "{}")'.format(cflags_repro),
+            "",
+            "# Debug flags (DEBUG)",
+            'set(FFLAGS_DEBUG "{}")'.format(fflags_debug),
+            'set(CFLAGS_DEBUG "{}")'.format(cflags_debug),
+            "",
+            "# Test flags (TEST)",
+            'set(FFLAGS_TEST "{}")'.format(fflags_test),
+            'set(CFLAGS_TEST "{}")'.format(cflags_test),
+            "",
+            "# OpenMP flags",
+            'set(FFLAGS_OPENMP "{}")'.format(fflags_openmp),
+            'set(CFLAGS_OPENMP "{}")'.format(cflags_openmp),
+            'set(LDFLAGS_OPENMP "{}")'.format(ldflags_openmp),
+            "",
+            "# Coverage flags",
+            'set(FFLAGS_COVERAGE "{}")'.format(fflags_coverage),
+            'set(CFLAGS_COVERAGE "{}")'.format(cflags_coverage),
+            "",
+        ])
+    else:
+        # Default flags when no template
+        lines.extend([
+            "# =============================================================================",
+            "# Compiler Configuration (defaults)",
+            "# =============================================================================",
+            "",
+            "# Base compiler flags",
+            'set(FFLAGS_BASE "")',
+            'set(CFLAGS_BASE "")',
+            "",
+            "# Optimization flags (PROD)",
+            'set(FFLAGS_OPT "-O3")',
+            'set(CFLAGS_OPT "-O2")',
+            "",
+            "# Reproducibility flags (REPRO)",
+            'set(FFLAGS_REPRO "-O2")',
+            'set(CFLAGS_REPRO "-O2")',
+            "",
+            "# Debug flags (DEBUG)",
+            'set(FFLAGS_DEBUG "-O0 -g")',
+            'set(CFLAGS_DEBUG "-O0 -g")',
+            "",
+            "# Test flags (TEST)",
+            'set(FFLAGS_TEST "${FFLAGS_OPT}")',
+            'set(CFLAGS_TEST "${CFLAGS_OPT}")',
+            "",
+            "# OpenMP flags",
+            'set(FFLAGS_OPENMP "-fopenmp")',
+            'set(CFLAGS_OPENMP "-fopenmp")',
+            'set(LDFLAGS_OPENMP "-fopenmp")',
+            "",
+            "# Coverage flags",
+            'set(FFLAGS_COVERAGE "")',
+            'set(CFLAGS_COVERAGE "")',
+            "",
+        ])
+
+    # Apply flags based on build type
+    lines.extend([
+        "# =============================================================================",
+        "# Apply Compiler Flags Based on Build Type",
+        "# =============================================================================",
+        "",
+        "# Select flags based on build type",
+        "if(PROD)",
+        '    set(CMAKE_Fortran_FLAGS "${CMAKE_Fortran_FLAGS} ${FFLAGS_BASE} ${FFLAGS_OPT}")',
+        '    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CFLAGS_BASE} ${CFLAGS_OPT}")',
+        "elseif(REPRO)",
+        '    set(CMAKE_Fortran_FLAGS "${CMAKE_Fortran_FLAGS} ${FFLAGS_BASE} ${FFLAGS_REPRO}")',
+        '    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CFLAGS_BASE} ${CFLAGS_REPRO}")',
+        "elseif(DEBUG_BUILD)",
+        '    set(CMAKE_Fortran_FLAGS "${CMAKE_Fortran_FLAGS} ${FFLAGS_BASE} ${FFLAGS_DEBUG}")',
+        '    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CFLAGS_BASE} ${CFLAGS_DEBUG}")',
+        "elseif(TEST_BUILD)",
+        '    set(CMAKE_Fortran_FLAGS "${CMAKE_Fortran_FLAGS} ${FFLAGS_BASE} ${FFLAGS_TEST}")',
+        '    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CFLAGS_BASE} ${CFLAGS_TEST}")',
+        "endif()",
+        "",
+    ])
+
+    # OpenMP support
+    lines.extend([
+        "# OpenMP support",
+        "if(OPENMP)",
+        "    find_package(OpenMP)",
+        "    if(OpenMP_FOUND)",
+        '        set(CMAKE_Fortran_FLAGS "${CMAKE_Fortran_FLAGS} ${FFLAGS_OPENMP}")',
+        '        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CFLAGS_OPENMP}")',
+        '        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${LDFLAGS_OPENMP}")',
+        '        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LDFLAGS_OPENMP}")',
+        "    endif()",
+        "endif()",
+        "",
+    ])
+
+    # Coverage support
+    lines.extend([
+        "# Coverage support",
+        "if(COVERAGE)",
+        '    set(CMAKE_Fortran_FLAGS "${CMAKE_Fortran_FLAGS} ${FFLAGS_COVERAGE}")',
+        '    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CFLAGS_COVERAGE}")',
+        "endif()",
+        "",
+    ])
+
+    # NetCDF handling
+    lines.extend([
+        "# NetCDF support",
+        'if(NETCDF STREQUAL "3")',
+        '    add_compile_definitions(use_LARGEFILE)',
+        "endif()",
+        "",
+    ])
+
+    # Real precision handling
+    lines.extend([
+        "# Real precision (R4 vs R8)",
+        "if(USE_R4)",
+        "    add_compile_definitions(OVERLOAD_R4)",
+        "endif()",
+        "",
+    ])
+
+    # CPP definitions from command line
+    if cppdefs:
+        # Parse cppdefs and convert to CMake add_compile_definitions
+        defs = []
+        for item in cppdefs.split():
+            if item.startswith("-D"):
+                defs.append(item[2:])  # Remove -D prefix
+            elif not item.startswith("-"):
+                defs.append(item)
+
+        if defs:
+            lines.extend([
+                "# =============================================================================",
+                "# Preprocessor Definitions",
+                "# =============================================================================",
+                "",
+            ])
+            for d in defs:
+                # Handle definitions with values
+                if "=" in d:
+                    name, value = d.split("=", 1)
+                    lines.append("add_compile_definitions({}={})".format(name, value))
+                else:
+                    lines.append("add_compile_definitions({})".format(d))
+            lines.append("")
+
+    # Other flags
+    if other_flags:
+        cleaned_other = clean_flags(other_flags)
+        # Extract -I flags for include directories
+        other_includes = []
+        other_flags_clean = []
+        for flag in cleaned_other.split():
+            if flag.startswith("-I"):
+                inc_path = flag[2:]
+                if inc_path:
+                    other_includes.append(inc_path)
+            else:
+                other_flags_clean.append(flag)
+
+        if other_flags_clean:
+            lines.extend([
+                "# Additional compiler flags from -o option",
+                'set(CMAKE_Fortran_FLAGS "${{CMAKE_Fortran_FLAGS}} {}")'.format(" ".join(other_flags_clean)),
+                'set(CMAKE_C_FLAGS "${{CMAKE_C_FLAGS}} {}")'.format(" ".join(other_flags_clean)),
+                "",
+            ])
+
+        # Include directories from -o flags
+        for inc in other_includes:
+            if inc not in [str(d) for d in include_dirs]:
+                try:
+                    include_dirs.append(Path(inc))
+                except Exception:
+                    pass
+
+    # Include directories
+    lines.extend([
+        "# =============================================================================",
+        "# Include Directories",
+        "# =============================================================================",
+        "",
+    ])
+
+    # Deduplicate include directories
+    unique_include_dirs = []
+    seen_dirs = set()  # type: Set[str]
+    for inc_dir in include_dirs:
+        dir_str = str(inc_dir)
+        if dir_str not in seen_dirs:
+            seen_dirs.add(dir_str)
+            unique_include_dirs.append(inc_dir)
+
+    if unique_include_dirs:
+        lines.append("include_directories(")
+        for inc_dir in unique_include_dirs:
+            lines.append('    "{}"'.format(inc_dir))
+        lines.append(")")
+        lines.append("")
+
+    # Fortran module output directory
+    lines.extend([
+        "# Fortran module output directory",
+        'set(CMAKE_Fortran_MODULE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/modules")',
+        'include_directories("${CMAKE_Fortran_MODULE_DIRECTORY}")',
+        "",
+    ])
+
+    # Source files section
+    lines.extend([
+        "# =============================================================================",
+        "# Source Files",
+        "# =============================================================================",
+        "",
+        "set(SOURCES",
+    ])
+
+    for source in sources:
+        lines.append('    "{}"'.format(source.path))
+
+    lines.extend([
+        ")",
+        "",
+    ])
+
+    # Use-cpp preprocessing
+    if use_cpp:
+        # Find Fortran files that need preprocessing
+        cpp_sources = [s for s in sources if s.suffix in PREPROCESSED_FORTRAN_SUFFIXES]
+
+        if cpp_sources:
+            lines.extend([
+                "# =============================================================================",
+                "# C Preprocessor for Fortran Files",
+                "# =============================================================================",
+                "",
+                "if(USE_CPP)",
+                "    # Find the C preprocessor",
+                "    find_program(CPP_EXECUTABLE cpp)",
+                "    if(NOT CPP_EXECUTABLE)",
+                "        find_program(CPP_EXECUTABLE gcc)",
+                "        if(CPP_EXECUTABLE)",
+                '            set(CPP_COMMAND "${CPP_EXECUTABLE}" -E)',
+                "        else()",
+                '            message(FATAL_ERROR "Could not find C preprocessor")',
+                "        endif()",
+                "    else()",
+                '        set(CPP_COMMAND "${CPP_EXECUTABLE}")',
+                "    endif()",
+                "",
+                "    # Create output directory for preprocessed files",
+                '    set(PREPROC_DIR "${CMAKE_CURRENT_BINARY_DIR}/preprocessed")',
+                '    file(MAKE_DIRECTORY "${PREPROC_DIR}")',
+                "",
+                "    # List to hold preprocessed source files",
+                "    set(PREPROCESSED_SOURCES)",
+                "",
+            ])
+
+            for source in cpp_sources:
+                output_name = "{}.DO_NOT_MODIFY.f90".format(source.name)
+                lines.extend([
+                    "    # Preprocess {}{}".format(source.name, source.suffix),
+                    '    set(_input_file "{}")'.format(source.path),
+                    '    set(_output_file "${{PREPROC_DIR}}/{}")'.format(output_name),
+                    "    add_custom_command(",
+                    "        OUTPUT ${_output_file}",
+                    "        COMMAND ${CPP_COMMAND} -nostdinc -C ${CMAKE_C_FLAGS}",
+                    "            $<TARGET_PROPERTY:" + target_name + ",COMPILE_DEFINITIONS>",
+                    "            ${_input_file} > ${_output_file}",
+                    "        DEPENDS ${_input_file}",
+                    '        COMMENT "Preprocessing {}{}"'.format(source.name, source.suffix),
+                    "    )",
+                    "    list(APPEND PREPROCESSED_SOURCES ${_output_file})",
+                    "",
+                ])
+
+            lines.extend([
+                '    # Replace original sources with preprocessed versions',
+                '    list(FILTER SOURCES EXCLUDE REGEX "\\\\.F90$|\\\\.F$")',
+                "    list(APPEND SOURCES ${PREPROCESSED_SOURCES})",
+                "endif()",
+                "",
+            ])
+
+    # Build the target
+    lines.extend([
+        "# =============================================================================",
+        "# Build Target",
+        "# =============================================================================",
+        "",
+    ])
+
+    if is_library:
+        lines.extend([
+            "add_library({} STATIC ${{SOURCES}})".format(target_name),
+            "",
+        ])
+    else:
+        lines.extend([
+            "add_executable({} ${{SOURCES}})".format(target_name),
+            "",
+        ])
+
+    # Link flags
+    if link_flags:
+        cleaned_link = clean_flags(link_flags)
+        if cleaned_link:
+            lines.extend([
+                "# Additional linker flags",
+                "target_link_options({} PRIVATE {})".format(target_name, cleaned_link),
+                "",
+            ])
+
+    # Link libraries from template
+    if template_config and template_config.libs:
+        cleaned_libs = clean_flags(template_config.libs)
+        if cleaned_libs:
+            lines.extend([
+                "# Libraries from template",
+                "# Note: Template specified: {}".format(cleaned_libs),
+                "# These may need to be adjusted for your CMake environment",
+                "",
+            ])
+
+    # Set the output name
+    if is_library:
+        lines.extend([
+            "# Set library output name",
+            'set_target_properties({} PROPERTIES OUTPUT_NAME "{}")'.format(target_name, target_name),
+            'set_target_properties({} PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${{CMAKE_CURRENT_BINARY_DIR}}")'.format(target_name),
+            "",
+        ])
+
+    # Module dependencies section for information
+    module_defs = {}  # type: Dict[str, str]  # module_name -> object that defines it
+    for source in sources:
+        for mod in source.modules_defined:
+            module_defs[mod] = source.name
+
+    lines.extend([
+        "# =============================================================================",
+        "# Module Dependencies (for reference)",
+        "# =============================================================================",
+        "# The following modules are defined in this project:",
+    ])
+
+    for mod_name in sorted(module_defs.keys()):
+        source_name = module_defs[mod_name]
+        lines.append("#   {} <- {}".format(mod_name, source_name))
+
+    lines.extend([
+        "",
+        "# CMake handles Fortran module dependencies automatically when using",
+        "# add_library or add_executable with Fortran sources.",
+        "",
+    ])
+
+    # Installation rules (optional)
+    lines.extend([
+        "# =============================================================================",
+        "# Installation (optional)",
+        "# =============================================================================",
+        "",
+        "install(TARGETS {}".format(target_name),
+        "    ARCHIVE DESTINATION lib",
+        "    LIBRARY DESTINATION lib",
+        "    RUNTIME DESTINATION bin",
+        ")",
+        "",
+        "# Install Fortran modules",
+        'install(DIRECTORY "${CMAKE_Fortran_MODULE_DIRECTORY}/"',
+        "    DESTINATION include",
+        '    FILES_MATCHING PATTERN "*.mod"',
+        ")",
+        "",
+    ])
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# CLI Interface
+# =============================================================================
+
+
+@click.command()
+@click.option(
+    "-a",
+    "--abspath",
+    "abs_path",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    help="Absolute path prefix for all relative paths.",
+)
+@click.option(
+    "-b",
+    "--blddir",
+    "build_dir",
+    type=click.Path(file_okay=False, dir_okay=True),
+    help="Build directory path.",
+)
+@click.option(
+    "-c",
+    "--cppdefs",
+    type=str,
+    default="",
+    help="CPP definitions (e.g., '-DUSE_NETCDF -DDEBUG').",
+)
+@click.option("-d", "--debug", is_flag=True, help="Enable debug output.")
+@click.option(
+    "-I",
+    "--includes",
+    "include_dirs",
+    multiple=True,
+    help="Include directories (can be specified multiple times).",
+)
+@click.option(
+    "-l",
+    "--linkflags",
+    type=str,
+    default="",
+    help="Additional linker flags.",
+)
+@click.option(
+    "-m",
+    "--makefile",
+    "output_file",
+    type=click.Path(),
+    default="CMakeLists.txt",
+    help="Output file name (default: CMakeLists.txt).",
+)
+@click.option(
+    "-o",
+    "--otherflags",
+    type=str,
+    default="",
+    help="Additional compiler flags.",
+)
+@click.option(
+    "-p",
+    "--program",
+    type=str,
+    default="a.out",
+    help="Target name (library.a or executable).",
+)
+@click.option(
+    "-t",
+    "--template",
+    "template_file",
+    type=click.Path(exists=True, dir_okay=False),
+    help="mkmf template file for compiler configuration.",
+)
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose output.")
+@click.option(
+    "-x",
+    "--execute",
+    is_flag=True,
+    help="Execute cmake after generating CMakeLists.txt.",
+)
+@click.option(
+    "--use-cpp",
+    "use_cpp",
+    is_flag=True,
+    help="Use C preprocessor for .F90 files.",
+)
+@click.option("-f", is_flag=True, hidden=True, help="Ignored (compatibility with mkmf).")
+@click.option("-g", "--git", is_flag=True, hidden=True, help="Ignored (compatibility with mkmf).")
+@click.version_option(version=__version__)
+@click.argument("targets", nargs=-1)
+def main(
+    abs_path,
+    build_dir,
+    cppdefs,
+    debug,
+    include_dirs,
+    linkflags,
+    output_file,
+    otherflags,
+    program,
+    template_file,
+    verbose,
+    execute,
+    use_cpp,
+    f,
+    git,
+    targets,
+):
+    # type: (...) -> None
+    """Generate CMakeLists.txt from source files and mkmf templates.
+
+    TARGETS can be directories, individual source files, or pathnames files
+    (generated by list_paths).
+
+    Example usage:
+
+        mkcf -t template.mk -p libFMS.a -c "-DUSE_NETCDF" path_names
+
+        cmake -DPROD=ON .
+
+        make
+
+    Build types (mutually exclusive):
+
+        -DPROD=ON       Production/optimization build (default)
+
+        -DREPRO=ON      Reproducibility build
+
+        -DDEBUG_BUILD=ON Debug build
+
+        -DTEST_BUILD=ON  Test build
+
+    Additional options:
+
+        -DOPENMP=ON     Enable OpenMP
+
+        -DCOVERAGE=ON   Enable code coverage
+
+        -DNETCDF=3      Use NetCDF 3 compatibility mode
+
+        -DUSE_R4=ON     Use single precision reals
+    """
+    # Enable verbose if debug is set
+    if debug:
+        verbose = True
+
+    if verbose:
+        click.echo("mkcf {}".format(__version__))
+        click.echo("Output file: {}".format(output_file))
+
+    # Add current directory to targets if empty
+    target_list = list(targets) if targets else ["."]
+
+    if verbose:
+        click.echo("Targets: {}".format(target_list))
+
+    # Convert paths
+    abs_path_obj = Path(abs_path) if abs_path else None
+    build_dir_obj = Path(build_dir) if build_dir else None
+    template_path = Path(template_file) if template_file else None
+    output_path = Path(output_file)
+
+    # Parse template if provided
+    template_config = None
+    if template_path:
+        if verbose:
+            click.echo("Parsing template: {}".format(template_path))
+        template_config = parse_template(template_path)
+
+    # Collect sources
+    if verbose:
+        click.echo("Collecting sources...")
+
+    sources, found_include_dirs = collect_sources(
+        target_list, abs_path_obj, list(include_dirs)
+    )
+
+    if not sources:
+        click.echo("Warning: No source files found.", err=True)
+
+    if verbose:
+        click.echo("Found {} source files".format(len(sources)))
+        for s in sources:
+            click.echo("  {}".format(s.path))
+
+    # Generate CMakeLists.txt
+    cmake_content = generate_cmakelists(
+        sources=sources,
+        include_dirs=found_include_dirs,
+        program_name=program,
+        cppdefs=cppdefs,
+        other_flags=otherflags,
+        link_flags=linkflags,
+        template_config=template_config,
+        src_root=abs_path_obj,
+        build_root=build_dir_obj,
+        use_cpp=use_cpp,
+        verbose=verbose,
+    )
+
+    # Write output file
+    output_path.write_text(cmake_content)
+    click.echo("CMakeLists.txt written to {}".format(output_path))
+
+    # Execute cmake if requested
+    if execute:
+        import subprocess
+
+        click.echo("Running cmake...")
+        try:
+            # Python 3.6 compatible subprocess call
+            result = subprocess.run(["cmake", "."])
+            if result.returncode != 0:
+                click.echo("cmake failed", err=True)
+                sys.exit(result.returncode)
+        except AttributeError:
+            # Fallback for very old Python
+            ret = subprocess.call(["cmake", "."])
+            if ret != 0:
+                click.echo("cmake failed", err=True)
+                sys.exit(ret)
+
+
+if __name__ == "__main__":
+    main()
