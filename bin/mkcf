@@ -1113,14 +1113,27 @@ def generate_cmakelists(
                 "",
             ])
 
-    # Set the output name
+    # Set the output name and output directories
     if is_library:
         lines.extend([
-            "# Set library output name",
+            "# Set library output name and directory",
             'set_target_properties({} PROPERTIES OUTPUT_NAME "{}")'.format(target_name, target_name),
             'set_target_properties({} PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${{CMAKE_CURRENT_BINARY_DIR}}")'.format(target_name),
             "",
         ])
+
+    # Post-build: copy object files to top-level directory for mkmf compatibility
+    lines.extend([
+        "# Copy object files to top-level directory (mkmf compatibility)",
+        "add_custom_command(TARGET {} POST_BUILD".format(target_name),
+        '    COMMAND ${CMAKE_COMMAND} -E copy_if_different',
+        '        $<TARGET_OBJECTS:{}>'.format(target_name),
+        '        ${CMAKE_CURRENT_BINARY_DIR}/',
+        '    COMMAND_EXPAND_LISTS',
+        '    COMMENT "Copying object files to build directory"',
+        ")",
+        "",
+    ])
 
     # Module dependencies section for information
     module_defs = {}  # type: Dict[str, str]  # module_name -> object that defines it
