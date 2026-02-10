@@ -997,6 +997,12 @@ def generate_cmakelists(
         cpp_sources = [s for s in sources if s.suffix in PREPROCESSED_FORTRAN_SUFFIXES]
 
         if cpp_sources:
+            # Build the include path string for CPP
+            include_flags = []
+            for inc_dir in include_dirs:
+                include_flags.append('-I"{}"'.format(inc_dir))
+            include_flags_str = " ".join(include_flags)
+
             lines.extend([
                 "# =============================================================================",
                 "# C Preprocessor for Fortran Files",
@@ -1020,6 +1026,20 @@ def generate_cmakelists(
                 '    set(PREPROC_DIR "${CMAKE_CURRENT_BINARY_DIR}/preprocessed")',
                 '    file(MAKE_DIRECTORY "${PREPROC_DIR}")',
                 "",
+                "    # Build include paths for CPP",
+                "    set(CPP_INCLUDES)",
+                "    get_property(_inc_dirs DIRECTORY PROPERTY INCLUDE_DIRECTORIES)",
+                "    foreach(_inc_dir ${_inc_dirs})",
+                '        list(APPEND CPP_INCLUDES "-I${_inc_dir}")',
+                "    endforeach()",
+                "",
+                "    # Build CPP definitions",
+                "    set(CPP_DEFS)",
+                "    get_property(_compile_defs DIRECTORY PROPERTY COMPILE_DEFINITIONS)",
+                "    foreach(_def ${_compile_defs})",
+                '        list(APPEND CPP_DEFS "-D${_def}")',
+                "    endforeach()",
+                "",
                 "    # List to hold preprocessed source files",
                 "    set(PREPROCESSED_SOURCES)",
                 "",
@@ -1033,11 +1053,11 @@ def generate_cmakelists(
                     '    set(_output_file "${{PREPROC_DIR}}/{}")'.format(output_name),
                     "    add_custom_command(",
                     "        OUTPUT ${_output_file}",
-                    "        COMMAND ${CPP_COMMAND} -nostdinc -C ${CMAKE_C_FLAGS}",
-                    "            $<TARGET_PROPERTY:" + target_name + ",COMPILE_DEFINITIONS>",
+                    "        COMMAND ${CPP_COMMAND} -nostdinc -C ${CPP_DEFS} ${CPP_INCLUDES}",
                     "            ${_input_file} > ${_output_file}",
                     "        DEPENDS ${_input_file}",
                     '        COMMENT "Preprocessing {}{}"'.format(source.name, source.suffix),
+                    "        VERBATIM",
                     "    )",
                     "    list(APPEND PREPROCESSED_SOURCES ${_output_file})",
                     "",
